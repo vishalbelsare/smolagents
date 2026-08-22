@@ -57,11 +57,11 @@ from .memory import (
     SystemPromptStep,
     TaskStep,
     Timing,
-    TokenUsage,
     ToolCall,
 )
 from .models import (
     CODEAGENT_RESPONSE_FORMAT,
+    MODEL_REGISTRY,
     ChatMessage,
     ChatMessageStreamDelta,
     ChatMessageToolCall,
@@ -75,8 +75,9 @@ from .monitoring import (
     AgentLogger,
     LogLevel,
     Monitor,
+    TokenUsage,
 )
-from .remote_executors import BlaxelExecutor, DockerExecutor, E2BExecutor, ModalExecutor, WasmExecutor
+from .remote_executors import BlaxelExecutor, DockerExecutor, E2BExecutor, ModalExecutor
 from .tools import BaseTool, Tool, validate_tool_arguments
 from .utils import (
     AgentError,
@@ -1019,7 +1020,12 @@ You have been provided with these additional arguments, that you can access dire
         """
         # Load model
         model_info = agent_dict["model"]
-        model_class = getattr(importlib.import_module("smolagents.models"), model_info["class"])
+        model_class = MODEL_REGISTRY.get(model_info["class"])
+        if model_class is None:
+            raise ValueError(
+                f"Unknown model class '{model_info['class']}'. "
+                f"Supported models: {', '.join(sorted(MODEL_REGISTRY.keys()))}"
+            )
         model = model_class.from_dict(model_info["data"])
         # Load tools
         tools = []
@@ -1028,7 +1034,12 @@ You have been provided with these additional arguments, that you can access dire
         # Load managed agents
         managed_agents = []
         for managed_agent_dict in agent_dict["managed_agents"]:
-            agent_class = getattr(importlib.import_module("smolagents.agents"), managed_agent_dict["class"])
+            agent_class = AGENT_REGISTRY.get(managed_agent_dict["class"])
+            if agent_class is None:
+                raise ValueError(
+                    f"Unknown agent class '{managed_agent_dict['class']}'. "
+                    f"Supported agents: {', '.join(sorted(AGENT_REGISTRY.keys()))}"
+                )
             managed_agent = agent_class.from_dict(managed_agent_dict, **kwargs)
             managed_agents.append(managed_agent)
         # Extract base agent parameters
@@ -1124,7 +1135,12 @@ You have been provided with these additional arguments, that you can access dire
         # Load managed agents from their respective folders, recursively
         managed_agents = []
         for managed_agent_name, managed_agent_class_name in agent_dict["managed_agents"].items():
-            agent_cls = getattr(importlib.import_module("smolagents.agents"), managed_agent_class_name)
+            agent_cls = AGENT_REGISTRY.get(managed_agent_class_name)
+            if agent_cls is None:
+                raise ValueError(
+                    f"Unknown agent class '{managed_agent_class_name}'. "
+                    f"Supported agents: {', '.join(sorted(AGENT_REGISTRY.keys()))}"
+                )
             managed_agents.append(agent_cls.from_folder(folder / "managed_agents" / managed_agent_name))
         agent_dict["managed_agents"] = {}
 
@@ -1497,7 +1513,7 @@ class CodeAgent(MultiStepAgent):
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         executor ([`PythonExecutor`], *optional*): Custom Python code executor. If not provided, a default executor will be created based on `executor_type`.
-        executor_type (`Literal["local", "blaxel", "e2b", "modal", "docker", "wasm"]`, default `"local"`): Type of code executor.
+        executor_type (`Literal["local", "blaxel", "e2b", "modal", "docker"]`, default `"local"`): Type of code executor.
         executor_kwargs (`dict`, *optional*): Additional arguments to pass to initialize the executor.
         max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
         stream_outputs (`bool`, *optional*, default `False`): Whether to stream outputs during execution.
@@ -1516,7 +1532,7 @@ class CodeAgent(MultiStepAgent):
         additional_authorized_imports: list[str] | None = None,
         planning_interval: int | None = None,
         executor: PythonExecutor = None,
-        executor_type: Literal["local", "blaxel", "e2b", "modal", "docker", "wasm"] = "local",
+        executor_type: Literal["local", "blaxel", "e2b", "modal", "docker"] = "local",
         executor_kwargs: dict[str, Any] | None = None,
         max_print_outputs_length: int | None = None,
         stream_outputs: bool = False,
@@ -1580,7 +1596,7 @@ class CodeAgent(MultiStepAgent):
             self.python_executor.cleanup()
 
     def create_python_executor(self) -> PythonExecutor:
-        if self.executor_type not in {"local", "blaxel", "e2b", "modal", "docker", "wasm"}:
+        if self.executor_type not in {"local", "blaxel", "e2b", "modal", "docker"}:
             raise ValueError(f"Unsupported executor type: {self.executor_type}")
 
         if self.executor_type == "local":
@@ -1595,7 +1611,6 @@ class CodeAgent(MultiStepAgent):
                 "blaxel": BlaxelExecutor,
                 "e2b": E2BExecutor,
                 "docker": DockerExecutor,
-                "wasm": WasmExecutor,
                 "modal": ModalExecutor,
             }
             return remote_executors[self.executor_type](
@@ -1786,3 +1801,13 @@ class CodeAgent(MultiStepAgent):
         code_agent_kwargs.update(kwargs)
         # Call the parent class's from_dict method
         return super().from_dict(agent_dict, **code_agent_kwargs)
+
+
+# Agent Registry for secure deserialization
+# This registry maps agent class names to their actual classes.
+# Only classes listed here can be instantiated during deserialization (from_dict/from_folder).
+# This prevents arbitrary code execution via importlib-based dynamic loading.
+AGENT_REGISTRY = {
+    "ToolCallingAgent": ToolCallingAgent,
+    "CodeAgent": CodeAgent,
+}

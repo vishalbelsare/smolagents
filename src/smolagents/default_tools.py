@@ -20,6 +20,7 @@ from typing import Any
 from .local_python_executor import (
     BASE_BUILTIN_MODULES,
     BASE_PYTHON_TOOLS,
+    MAX_EXECUTION_TIME_SECONDS,
     evaluate_python_code,
 )
 from .tools import PipelineTool, Tool
@@ -46,7 +47,7 @@ class PythonInterpreterTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, *args, authorized_imports=None, **kwargs):
+    def __init__(self, *args, authorized_imports=None, timeout_seconds=MAX_EXECUTION_TIME_SECONDS, **kwargs):
         if authorized_imports is None:
             self.authorized_imports = list(set(BASE_BUILTIN_MODULES))
         else:
@@ -62,6 +63,7 @@ class PythonInterpreterTool(Tool):
         }
         self.base_python_tools = BASE_PYTHON_TOOLS
         self.python_evaluator = evaluate_python_code
+        self.timeout_seconds = timeout_seconds
         super().__init__(*args, **kwargs)
 
     def forward(self, code: str) -> str:
@@ -72,6 +74,7 @@ class PythonInterpreterTool(Tool):
                 state=state,
                 static_tools=self.base_python_tools,
                 authorized_imports=self.authorized_imports,
+                timeout_seconds=self.timeout_seconds,
             )[0]  # The second element is boolean is_final_answer
         )
         return f"Stdout:\n{str(state['_print_outputs'])}\nOutput: {output}"
@@ -358,6 +361,8 @@ class WebSearchTool(Tool):
             return self.search_duckduckgo(query)
         elif self.engine == "bing":
             return self.search_bing(query)
+        elif self.engine == "exa":
+            return self.search_exa(query)
         else:
             raise ValueError(f"Unsupported engine: {self.engine}")
 
@@ -446,6 +451,41 @@ class WebSearchTool(Tool):
             for item in items[: self.max_results]
         ]
         return results
+
+    def search_exa(self, query: str) -> list:
+        """Search using the Exa API. Requires an EXA_API_KEY environment variable."""
+        import os
+
+        import requests
+
+        api_key = os.getenv("EXA_API_KEY")
+        if not api_key:
+            raise ValueError("Missing API key. Make sure you have 'EXA_API_KEY' in your env variables.")
+
+        response = requests.post(
+            "https://api.exa.ai/search",
+            headers={
+                "x-api-key": api_key,
+                "Content-Type": "application/json",
+                "x-exa-integration": "smolagents",
+            },
+            json={
+                "query": query,
+                "numResults": self.max_results,
+                "contents": {"highlights": True},
+            },
+            timeout=getattr(self, "timeout", 30),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return [
+            {
+                "title": result.get("title", ""),
+                "link": result["url"],
+                "description": " ".join(result.get("highlights") or []),
+            }
+            for result in data.get("results", [])
+        ]
 
 
 class VisitWebpageTool(Tool):

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import ast
+import time
 import types
 from contextlib import nullcontext as does_not_raise
 from textwrap import dedent
@@ -27,6 +28,7 @@ from smolagents.default_tools import BASE_PYTHON_TOOLS, FinalAnswerTool
 from smolagents.local_python_executor import (
     DANGEROUS_FUNCTIONS,
     DANGEROUS_MODULES,
+    ExecutionTimeoutError,
     InterpreterError,
     LocalPythonExecutor,
     PrintContainer,
@@ -38,6 +40,7 @@ from smolagents.local_python_executor import (
     evaluate_subscript,
     fix_final_answer_code,
     get_safe_module,
+    timeout,
 )
 
 
@@ -1048,6 +1051,171 @@ assert lock.locked == False
         tools = {}
         evaluate_python_code(code, tools, state=state)
 
+    def test_with_context_manager_enter_returns_different_object(self):
+        """Test that __exit__ is called on the context manager, not the __enter__ return value."""
+        code = """
+class MyContextManager:
+    def __init__(self):
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return "I am NOT the context manager"
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exited = True
+        return False
+
+cm = MyContextManager()
+with cm as val:
+    assert val == "I am NOT the context manager"
+    assert cm.entered == True
+
+assert cm.exited == True
+    """
+        evaluate_python_code(code, {}, state={})
+
+    def test_with_context_manager_no_as_clause_exit_called(self):
+        """Test that __exit__ is called on context managers used without 'as' clause."""
+        code = """
+class MyContextManager:
+    def __init__(self):
+        self.exited = False
+
+    def __enter__(self):
+        return "not self"
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exited = True
+        return False
+
+cm = MyContextManager()
+with cm:
+    pass
+
+assert cm.exited == True
+    """
+        evaluate_python_code(code, {}, state={})
+
+    def test_with_exception_suppressed_by_exit(self):
+        """Test that __exit__ returning True suppresses the exception."""
+        code = """
+class Suppressor:
+    def __init__(self):
+        self.exit_called = False
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exit_called = True
+        return True  # suppress
+
+cm = Suppressor()
+with cm:
+    raise ValueError("should be suppressed")
+
+assert cm.exit_called == True
+        """
+        evaluate_python_code(code, {}, state={})
+
+    def test_with_exception_not_suppressed_by_exit(self):
+        """Test that __exit__ returning False re-raises the original exception."""
+        code = """
+class NonSuppressor:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+with NonSuppressor():
+    raise ValueError("should propagate")
+        """
+        with pytest.raises(ValueError, match="should propagate"):
+            evaluate_python_code(code, {}, state={})
+
+    def test_with_multiple_cms_inner_suppresses_outer_sees_no_exception(self):
+        """Test that when the inner CM suppresses, the outer CM's __exit__ gets (None, None, None)."""
+        code = """
+calls = []
+
+class Outer:
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        calls.append(("outer", exc_type))
+        return False
+
+class Inner:
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        calls.append(("inner", exc_type))
+        return True  # suppress
+
+with Outer(), Inner():
+    raise ValueError("suppressed by inner")
+
+assert calls[0] == ("inner", ValueError), calls
+assert calls[1] == ("outer", None), calls
+        """
+        evaluate_python_code(code, {}, state={})
+
+    def test_with_multiple_cms_neither_suppresses(self):
+        """Test that when no CM suppresses, the original exception propagates."""
+        code = """
+calls = []
+
+class Recorder:
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        calls.append((self.name, exc_type))
+        return False
+
+with Recorder("outer"), Recorder("inner"):
+    raise RuntimeError("should propagate")
+        """
+        with pytest.raises(InterpreterError, match="should propagate"):
+            evaluate_python_code(code, {}, state={})
+
+    def test_with_multiple_cms_outer_suppresses(self):
+        """Test that the outer CM can suppress after the inner CM does not."""
+        code = """
+calls = []
+
+class Outer:
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        calls.append(("outer", exc_type))
+        return True  # suppress
+
+class Inner:
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        calls.append(("inner", exc_type))
+        return False  # don't suppress
+
+with Outer(), Inner():
+    raise ValueError("suppressed by outer")
+
+assert calls[0] == ("inner", ValueError), calls
+assert calls[1] == ("outer", ValueError), calls
+        """
+        evaluate_python_code(code, {}, state={})
+
+    def test_with_exit_raising_replaces_original_exception(self):
+        """Test that an exception raised inside __exit__ replaces the original."""
+        code = """
+class RaisingExit:
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        raise RuntimeError("from __exit__")
+
+with RaisingExit():
+    raise ValueError("original")
+        """
+        with pytest.raises(InterpreterError, match="from __exit__"):
+            evaluate_python_code(code, {}, state={})
+
     def test_default_arg_in_function(self):
         code = """
 def f(a, b=333, n=1000):
@@ -1234,6 +1402,24 @@ exec(compile('{unsafe_code}', 'no filename', 'exec'))
         code = "final_answer(answer=2)"
         result, _ = evaluate_python_code(code, {"final_answer": (lambda answer: 2 * answer)}, state={})
         assert result == 4
+
+    def test_final_answer_not_caught_by_except_exception(self):
+        """Test that final_answer is not caught by generic 'except Exception' clauses.
+
+        This test reproduces the issue from GitHub issue #1905 where agent-generated
+        code with try/except Exception blocks would incorrectly catch FinalAnswerException.
+        """
+        code = dedent("""
+            try:
+                final_answer(1)
+            except Exception as e:
+                final_answer(2)
+        """)
+        result, is_final_answer = evaluate_python_code(code, {"final_answer": (lambda answer: answer)}, state={})
+        # The result should be 1 (from the first final_answer call),
+        # not 2 (which would happen if FinalAnswerException was caught)
+        assert result == 1
+        assert is_final_answer is True
 
     def test_dangerous_builtins_are_callable_if_explicitly_added(self):
         dangerous_code = dedent("""
@@ -1986,6 +2172,146 @@ Input:    {input_code}
 Expected: {expected}
 Got:      {result}
 """
+
+
+class TestTimeout:
+    """Test the timeout mechanism for code execution."""
+
+    def test_timeout_decorator_completes_within_limit(self):
+        """Test that code completing within the timeout limit works correctly."""
+
+        @timeout(2)
+        def short_task():
+            time.sleep(0.1)
+            return "completed"
+
+        assert short_task() == "completed"
+
+    def test_timeout_decorator_raises_error_when_exceeded(self):
+        """Test that code exceeding the timeout limit raises ExecutionTimeoutError."""
+
+        @timeout(1)
+        def long_task():
+            time.sleep(2)
+            return "should not complete"
+
+        with pytest.raises(ExecutionTimeoutError, match="Code execution exceeded the maximum execution time"):
+            long_task()
+
+    def test_evaluate_python_code_with_timeout_completes(self):
+        """Test that evaluate_python_code completes within timeout for quick code."""
+        code = "result = 2 + 2"
+        result, is_final = evaluate_python_code(code)
+        assert result == 4
+
+    def test_evaluate_python_code_with_timeout_raises(self):
+        """Test that evaluate_python_code raises timeout error for long-running code."""
+        # Use a short custom timeout (2 seconds) with longer sleep (3 seconds) to test quickly
+        code = """
+import time
+time.sleep(3)
+result = "should not complete"
+"""
+        with pytest.raises(ExecutionTimeoutError, match="Code execution exceeded the maximum execution time"):
+            evaluate_python_code(code, authorized_imports=["time"], timeout_seconds=2)
+
+    def test_timeout_works_in_thread(self):
+        """Test that timeout mechanism works when called from a non-main thread.
+
+        This verifies the fix for the issue where signal-based timeouts failed
+        in threads (signals only work in the main thread).
+        """
+        import threading
+
+        result = {"success": False, "error": None}
+
+        def run_in_thread():
+            try:
+                # Quick code should work
+                code = "result = 42"
+                res, _ = evaluate_python_code(code)
+                assert res == 42
+
+                # Timeout should still work in thread - use short timeout for fast test
+                timeout_code = """
+import time
+time.sleep(3)
+"""
+                try:
+                    evaluate_python_code(timeout_code, authorized_imports=["time"], timeout_seconds=2)
+                    result["error"] = "Code should have timed out but didn't"
+                except ExecutionTimeoutError:
+                    result["success"] = True
+            except Exception as e:
+                result["error"] = f"{type(e).__name__}: {e}"
+
+        thread = threading.Thread(target=run_in_thread)
+        thread.start()
+        thread.join(timeout=10)
+
+        assert not thread.is_alive(), "Thread should have completed"
+        assert result["error"] is None, f"Error in thread: {result['error']}"
+        assert result["success"], "Timeout should have been raised in thread"
+
+    def test_custom_timeout_value(self):
+        """Test that a custom timeout value can be specified."""
+        # Code that sleeps for 2 seconds should timeout with 1-second limit
+        code = """
+import time
+time.sleep(2)
+"""
+        with pytest.raises(ExecutionTimeoutError, match="Code execution exceeded the maximum execution time of 1"):
+            evaluate_python_code(code, authorized_imports=["time"], timeout_seconds=1)
+
+    def test_longer_timeout_value(self):
+        """Test that a longer custom timeout value allows longer execution."""
+        # Code that sleeps for 2 seconds should complete with 5-second limit
+        code = """
+import time
+time.sleep(2)
+result = "completed"
+"""
+        result, is_final = evaluate_python_code(code, authorized_imports=["time"], timeout_seconds=5)
+        assert result == "completed"
+
+    def test_disabled_timeout(self):
+        """Test that timeout can be disabled by setting it to None."""
+        # Even slow code should complete when timeout is disabled
+        # Using a shorter sleep to keep test fast, but demonstrating None works
+        code = """
+import time
+time.sleep(0.5)
+result = "completed without timeout"
+"""
+        result, is_final = evaluate_python_code(code, authorized_imports=["time"], timeout_seconds=None)
+        assert result == "completed without timeout"
+
+    def test_local_executor_custom_timeout(self):
+        """Test that LocalPythonExecutor respects custom timeout."""
+        executor = LocalPythonExecutor(additional_authorized_imports=["time"], timeout_seconds=1)
+        executor.send_tools({})
+
+        # Code that sleeps for 2 seconds should timeout with 1-second executor limit
+        code = """
+import time
+time.sleep(2)
+"""
+        with pytest.raises(ExecutionTimeoutError, match="Code execution exceeded the maximum execution time of 1"):
+            executor(code)
+
+    def test_local_executor_disabled_timeout(self):
+        """Test that LocalPythonExecutor can disable timeout."""
+        executor = LocalPythonExecutor(additional_authorized_imports=["time"], timeout_seconds=None)
+        executor.send_tools({})
+
+        # Code should complete even without timeout
+        code = """
+import time
+time.sleep(0.5)
+result = "completed"
+"""
+        output = executor(code)
+        assert output.output == "completed"
 
 
 @pytest.mark.parametrize(

@@ -1153,7 +1153,7 @@ class ApiModel(Model):
         requests_per_minute (`float`, **optional**):
             Rate limit in requests per minute.
         retry (`bool`, **optional**):
-            Wether to retry on rate limit errors, up to RETRY_MAX_ATTEMPTS times. Defaults to True.
+            Whether to retry on rate limit errors, up to RETRY_MAX_ATTEMPTS times. Defaults to True.
         **kwargs:
             Additional keyword arguments to forward to the underlying model completion call.
     """
@@ -2061,6 +2061,23 @@ class AmazonBedrockModel(ApiModel):
 
 
 AmazonBedrockServerModel = AmazonBedrockModel
+
+
+# Model Registry for secure deserialization
+# This registry maps model class names to their actual classes.
+# Only classes listed here can be instantiated during deserialization (from_dict).
+# This prevents arbitrary code execution via importlib-based dynamic loading.
+MODEL_REGISTRY = {
+    "VLLMModel": VLLMModel,
+    "MLXModel": MLXModel,
+    "TransformersModel": TransformersModel,
+    "LiteLLMModel": LiteLLMModel,
+    "LiteLLMRouterModel": LiteLLMRouterModel,
+    "InferenceClientModel": InferenceClientModel,
+    "OpenAIModel": OpenAIModel,
+    "AzureOpenAIModel": AzureOpenAIModel,
+    "AmazonBedrockModel": AmazonBedrockModel,
+}
 
 __all__ = [
     "REMOVE_PARAMETER",
